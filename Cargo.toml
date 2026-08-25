@@ -1,5 +1,5 @@
 [package]
-name = "gambit-client"
+name = "gambit-rs"
 version = "0.1.0"
 edition = "2024"
 description = "Asynchronous Rust client for Gambit's observed web protocol"
@@ -7,7 +7,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [lib]
-name = "gambit_client"
+name = "gambit_rs"
 path = "src/lib.rs"
 
 [dependencies]

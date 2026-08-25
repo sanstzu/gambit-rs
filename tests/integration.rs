@@ -10,7 +10,7 @@ use axum::{
     routing::{any, post},
 };
 use futures_util::{SinkExt, StreamExt};
-use gambit_client::{ClientConfig, Credentials, Error, GambitClient};
+use gambit_rs::{ClientConfig, Credentials, Error, GambitClient};
 use serde_json::{Value, json};
 use tokio::{
     net::TcpListener,
