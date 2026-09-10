@@ -96,10 +96,13 @@ pub(crate) fn decode_server_message(text: &str) -> Result<ServerMessage> {
         let value = object
             .get("snapshot")
             .ok_or_else(|| Error::Protocol("snapshot message has no snapshot field".to_owned()))?;
-        Some(
-            serde_json::from_value(value.clone())
-                .map_err(|_| Error::Protocol("server sent an invalid snapshot".to_owned()))?,
-        )
+        Some(serde_path_to_error::deserialize(value).map_err(|error| {
+            // Serde's underlying error can quote a server-supplied value.
+            Error::Protocol(format!(
+                "server sent an invalid snapshot at {}: field has an invalid type or value",
+                error.path()
+            ))
+        })?)
     } else {
         None
     };
@@ -123,6 +126,23 @@ mod tests {
     use serde_json::to_value;
 
     use super::*;
+
+    #[test]
+    fn snapshot_errors_identify_fields_without_echoing_values() {
+        let error = decode_server_message(
+            &json!({
+                "type": "snapshot",
+                "snapshot": {"tableId": "test", "seats": [
+                    {"seat": 1, "stack": "secret-value"}
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("seats[0].stack"), "{error}");
+        assert!(!error.contains("secret-value"));
+    }
 
     #[test]
     fn envelope_matches_observed_shape() {

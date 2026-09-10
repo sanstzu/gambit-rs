@@ -20,7 +20,7 @@ use tokio_tungstenite::{
 
 use crate::{
     Action, AfkWarning, AuthSession, ClientConfig, Error, GameMode, LiveBust, LiveRejoinResult,
-    LiveTableMatch, Result, SeatRejected, TableSnapshot,
+    LiveTableMatch, MAX_SEATS, Result, SeatRejected, TableSnapshot,
     models::TurnKey,
     protocol::{
         ActionIdGenerator, ServerMessage, decode_server_message, envelope, now_ms,
@@ -77,6 +77,7 @@ pub(crate) struct SessionInner {
     state: Mutex<SessionState>,
     snapshots: watch::Sender<Option<VersionedSnapshot>>,
     events: broadcast::Sender<GameEvent>,
+    raw_messages: broadcast::Sender<Arc<Value>>,
     receiver_task: StdMutex<Option<JoinHandle<()>>>,
     heartbeat_task: StdMutex<Option<JoinHandle<()>>>,
 }
@@ -99,6 +100,7 @@ impl GameSession {
     pub(crate) async fn open(auth: AuthSession, config: ClientConfig) -> Result<Self> {
         let (snapshots, _) = watch::channel(None);
         let (events, _) = broadcast::channel(128);
+        let (raw_messages, _) = broadcast::channel(128);
         let session = Self {
             inner: Arc::new(SessionInner {
                 auth,
@@ -116,6 +118,7 @@ impl GameSession {
                 }),
                 snapshots,
                 events,
+                raw_messages,
                 receiver_task: StdMutex::new(None),
                 heartbeat_task: StdMutex::new(None),
             }),
@@ -199,6 +202,18 @@ impl GameSession {
     #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<GameEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// Subscribes to complete decoded inbound JSON envelopes, including snapshots.
+    ///
+    /// This bounded stream starts at subscription time and can report lag. It does
+    /// not replay earlier messages or include outbound authentication payloads.
+    /// Values are untrusted and may contain personal data. Do not log credentials
+    /// or bearer tokens. JSON values preserve fields, not wire whitespace or bytes.
+    /// Typed subscribers still receive one event per snapshot.
+    #[must_use]
+    pub fn subscribe_raw_messages(&self) -> broadcast::Receiver<Arc<Value>> {
+        self.inner.raw_messages.subscribe()
     }
 
     /// Returns the latest authoritative table snapshot, if one has arrived.
@@ -368,10 +383,10 @@ impl GameSession {
         seat_number: u8,
         wait_timeout: Option<Duration>,
     ) -> Result<Arc<TableSnapshot>> {
-        if !(1..=6).contains(&seat_number) {
-            return Err(Error::Seating(
-                "seat number must be between 1 and 6".to_owned(),
-            ));
+        if !(1..=MAX_SEATS).contains(&seat_number) {
+            return Err(Error::Seating(format!(
+                "seat number must be between 1 and {MAX_SEATS}"
+            )));
         }
         let snapshot = self
             .snapshot()
@@ -607,6 +622,52 @@ impl GameSession {
         self.act(Action::AllIn, None).await
     }
 
+    /// Sends the observed rebuy command for a seated, busted player outside a hand.
+    ///
+    /// Success means the frame was sent, not that the server granted chips. The
+    /// amount is server-controlled. Observe later snapshots for the outcome.
+    /// This does not replace live reservation rejoin or bot-game restart flows.
+    /// No retry or replay occurs, including after an ambiguous transport failure.
+    pub async fn rebuy(&self) -> Result<()> {
+        self.require_open().await?;
+        let snapshot = self.snapshot().ok_or_else(|| {
+            Error::IllegalAction("rebuy requires an authoritative table snapshot".to_owned())
+        })?;
+        let joined = self
+            .inner
+            .state
+            .lock()
+            .await
+            .join
+            .as_ref()
+            .is_some_and(|join| {
+                join.payload.get("tableId").and_then(Value::as_str)
+                    == Some(snapshot.table_id.as_str())
+            });
+        if !joined {
+            return Err(Error::IllegalAction(
+                "rebuy requires the current joined table".to_owned(),
+            ));
+        }
+        let hero = snapshot
+            .hero()
+            .filter(|hero| snapshot.is_seated() && !hero.is_open())
+            .ok_or_else(|| Error::IllegalAction("rebuy requires a seated player".to_owned()))?;
+        if hero.stack != 0 {
+            return Err(Error::IllegalAction(
+                "rebuy requires an empty stack".to_owned(),
+            ));
+        }
+        if hero.is_all_in()
+            || (hero.cards.as_ref().is_some_and(|cards| !cards.is_empty()) && !hero.is_folded())
+        {
+            return Err(Error::IllegalAction(
+                "cannot rebuy while holding an active hand".to_owned(),
+            ));
+        }
+        self.send("rebuy", json!({}), true).await
+    }
+
     pub async fn live_rejoin(&self, slug: Option<&str>) -> Result<LiveRejoinResult> {
         let mut events = self.subscribe_events();
         let payload = slug.map_or_else(|| json!({}), |slug| json!({"slug": slug}));
@@ -741,6 +802,8 @@ async fn receive_loop(
 }
 
 async fn handle_server_message(inner: &Arc<SessionInner>, message: ServerMessage) {
+    let raw = Arc::new(message.raw);
+    let _ = inner.raw_messages.send(Arc::clone(&raw));
     match message.message_type.as_str() {
         "authenticated" => {
             let _ = inner.events.send(GameEvent::Authenticated);
@@ -831,7 +894,7 @@ async fn handle_server_message(inner: &Arc<SessionInner>, message: ServerMessage
             ));
         }
         _ => {
-            let _ = inner.events.send(GameEvent::Raw(Arc::new(message.raw)));
+            let _ = inner.events.send(GameEvent::Raw(raw));
         }
     }
 }
