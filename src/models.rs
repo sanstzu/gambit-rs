@@ -100,6 +100,7 @@ impl fmt::Debug for AuthSession {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BetRaiseBounds {
+    /// A null or absent wire value means the minimum is unknown.
     /// No normal bet or raise is permitted locally when the minimum is unknown.
     #[serde(default)]
     pub min_to: Option<u64>,
@@ -619,23 +620,6 @@ impl TableSnapshot {
             .map(|seat| seat.seat)
             .collect()
     }
-
-    pub(crate) fn turn_key(&self) -> TurnKey {
-        TurnKey {
-            hand_id: self.hand_id.clone(),
-            street: self.street.clone(),
-            to_act_seat: self.to_act_seat,
-            turn_ends_at_ms: self.turn_ends_at_ms,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TurnKey {
-    pub hand_id: Option<String>,
-    pub street: Option<String>,
-    pub to_act_seat: Option<u8>,
-    pub turn_ends_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -857,19 +841,45 @@ mod tests {
     }
 
     #[test]
-    fn unknown_raise_minimum_never_guesses_a_legal_raise() {
+    fn snapshot_with_unknown_raise_minimum_never_guesses_a_legal_raise() {
         for bounds in [json!({"minTo": null, "maxTo": 200}), json!({"maxTo": 200})] {
-            let allowed: AllowedActions =
-                serde_json::from_value(json!({"betRaise": bounds, "allIn": 200})).unwrap();
+            let snapshot: TableSnapshot = serde_json::from_value(json!({
+                "tableId": "default",
+                "allowed": {"betRaise": bounds, "allIn": 200}
+            }))
+            .unwrap();
+            let allowed = snapshot.allowed.unwrap();
+            assert_eq!(
+                allowed.bet_raise,
+                Some(BetRaiseBounds {
+                    min_to: None,
+                    max_to: 200,
+                })
+            );
             for action in [Action::Bet, Action::Raise] {
-                for amount in [None, Some(0), Some(100), Some(200)] {
+                for amount in [None, Some(0), Some(100), Some(200), Some(201)] {
                     assert!(!allowed.permits(action, amount));
                 }
             }
             assert!(allowed.permits(Action::AllIn, None));
         }
-        let allowed: AllowedActions =
-            serde_json::from_value(json!({"betRaise": {"minTo": 4, "maxTo": 200}})).unwrap();
+    }
+
+    #[test]
+    fn snapshot_with_known_raise_minimum_checks_inclusive_bounds() {
+        let snapshot: TableSnapshot = serde_json::from_value(json!({
+            "tableId": "default",
+            "allowed": {"betRaise": {"minTo": 4, "maxTo": 200}}
+        }))
+        .unwrap();
+        let allowed = snapshot.allowed.unwrap();
+        assert_eq!(
+            allowed.bet_raise,
+            Some(BetRaiseBounds {
+                min_to: Some(4),
+                max_to: 200,
+            })
+        );
         for action in [Action::Bet, Action::Raise] {
             for amount in [4, 100, 200] {
                 assert!(allowed.permits(action, Some(amount)));

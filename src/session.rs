@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -21,7 +24,6 @@ use tokio_tungstenite::{
 use crate::{
     Action, AfkWarning, AuthSession, ClientConfig, Error, GameMode, LiveBust, LiveRejoinResult,
     LiveTableMatch, MAX_SEATS, Result, SeatRejected, TableSnapshot,
-    models::TurnKey,
     protocol::{
         ActionIdGenerator, ServerMessage, decode_server_message, envelope, now_ms,
         player_action_payload,
@@ -58,21 +60,37 @@ struct JoinState {
     mode: GameMode,
 }
 
+// Deadlines and legal-action metadata can refresh within a turn. Only observed
+// table/hand/street/actor progression establishes another turn.
+#[derive(Debug, Eq, PartialEq)]
+struct TurnPosition {
+    table_id: String,
+    hand_id: Option<String>,
+    street: Option<String>,
+    seat: u8,
+}
+
 #[derive(Debug)]
 struct SessionState {
     closed: bool,
+    connection_generation: u64,
     ids: ActionIdGenerator,
     join: Option<JoinState>,
     mode: GameMode,
     table_match: Option<LiveTableMatch>,
-    acted_turn: Option<TurnKey>,
+    turn_position: Option<TurnPosition>,
+    turn_generation: u64,
+    acted_turn: Option<u64>,
+    snapshot_version: u64,
     seating_pending: bool,
     stand_up_pending: bool,
 }
 
 pub(crate) struct SessionInner {
+    public_handles: AtomicUsize,
     auth: AuthSession,
     config: ClientConfig,
+    lifecycle: Mutex<()>,
     writer: Mutex<Option<SocketWriter>>,
     state: Mutex<SessionState>,
     snapshots: watch::Sender<Option<VersionedSnapshot>>,
@@ -83,7 +101,6 @@ pub(crate) struct SessionInner {
 }
 
 /// One authenticated WebSocket and its latest authoritative table state.
-#[derive(Clone)]
 pub struct GameSession {
     pub(crate) inner: Arc<SessionInner>,
 }
@@ -103,16 +120,22 @@ impl GameSession {
         let (raw_messages, _) = broadcast::channel(128);
         let session = Self {
             inner: Arc::new(SessionInner {
+                public_handles: AtomicUsize::new(1),
                 auth,
                 config,
+                lifecycle: Mutex::new(()),
                 writer: Mutex::new(None),
                 state: Mutex::new(SessionState {
-                    closed: false,
+                    closed: true,
+                    connection_generation: 0,
                     ids: ActionIdGenerator::create(),
                     join: None,
                     mode: GameMode::Unknown,
                     table_match: None,
+                    turn_position: None,
+                    turn_generation: 0,
                     acted_turn: None,
+                    snapshot_version: 0,
                     seating_pending: false,
                     stand_up_pending: false,
                 }),
@@ -128,6 +151,14 @@ impl GameSession {
     }
 
     async fn connect(&self) -> Result<()> {
+        let result = self.connect_inner().await;
+        if result.is_err() {
+            self.stop_connection().await;
+        }
+        result
+    }
+
+    async fn connect_inner(&self) -> Result<()> {
         let mut request = self
             .inner
             .config
@@ -150,12 +181,18 @@ impl GameSession {
             .map_err(|error| Error::Transport(format!("could not open WebSocket: {error}")))?;
         let (writer, reader) = socket.split();
         *self.inner.writer.lock().await = Some(writer);
+        let generation = {
+            let mut state = self.inner.state.lock().await;
+            state.connection_generation += 1;
+            state.closed = false;
+            state.connection_generation
+        };
 
         let inner = Arc::clone(&self.inner);
         replace_task(
             &self.inner.receiver_task,
             tokio::spawn(async move {
-                receive_loop(inner, reader).await;
+                receive_loop(inner, reader, generation).await;
             }),
         );
 
@@ -193,7 +230,7 @@ impl GameSession {
         replace_task(
             &self.inner.heartbeat_task,
             tokio::spawn(async move {
-                heartbeat_loop(inner).await;
+                heartbeat_loop(inner, generation).await;
             }),
         );
         Ok(())
@@ -452,6 +489,7 @@ impl GameSession {
                         reason: rejection.reason,
                     });
                 }
+                Ok(Ok(GameEvent::Closed)) => return Err(Error::Closed),
                 Ok(Ok(GameEvent::ConnectionError(error))) => {
                     return Err(Error::Transport(error));
                 }
@@ -486,6 +524,7 @@ impl GameSession {
             let duration = wait_timeout.unwrap_or(self.inner.config.websocket_timeout);
             timeout(duration, async {
                 loop {
+                    self.require_open().await?;
                     if let Some(snapshot) = self.snapshot()
                         && !snapshot.is_seated()
                     {
@@ -511,6 +550,7 @@ impl GameSession {
         let mut snapshots = self.inner.snapshots.subscribe();
         timeout(duration, async {
             loop {
+                self.require_open().await?;
                 if let Some(versioned) = snapshots.borrow().as_ref()
                     && versioned.version > after_version
                 {
@@ -531,12 +571,19 @@ impl GameSession {
         let deadline = Instant::now() + duration;
         let mut snapshots = self.inner.snapshots.subscribe();
         loop {
-            if let Some(snapshot) = self.snapshot()
-                && snapshot.is_our_turn()
-                && snapshot.allowed.is_some()
-                && self.inner.state.lock().await.acted_turn.as_ref() != Some(&snapshot.turn_key())
             {
-                return Ok(snapshot);
+                let state = self.inner.state.lock().await;
+                if state.closed {
+                    return Err(Error::Closed);
+                }
+                if let Some(snapshot) = self.snapshot()
+                    && snapshot.is_seated()
+                    && snapshot.is_our_turn()
+                    && snapshot.allowed.is_some()
+                    && state.acted_turn != Some(state.turn_generation)
+                {
+                    return Ok(snapshot);
+                }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -550,6 +597,14 @@ impl GameSession {
     }
 
     pub async fn act(&self, action: Action, amount: Option<u64>) -> Result<()> {
+        // Acquire the writer first so queued actions validate the latest state.
+        // Keep the state lock through the send: publication, validation and the
+        // reservation must not race with each other or with disconnection.
+        let mut writer = self.inner.writer.lock().await;
+        let mut state = self.inner.state.lock().await;
+        if state.closed || writer.is_none() {
+            return Err(Error::Closed);
+        }
         let snapshot = self.snapshot().ok_or_else(|| {
             Error::IllegalAction("no authoritative snapshot is available".to_owned())
         })?;
@@ -576,16 +631,12 @@ impl GameSession {
             ));
         }
 
-        let turn = snapshot.turn_key();
-        {
-            let mut state = self.inner.state.lock().await;
-            if state.acted_turn.as_ref() == Some(&turn) {
-                return Err(Error::StaleTurn);
-            }
-            // Reserve before I/O. A failed send is ambiguous and must never be retried automatically.
-            state.acted_turn = Some(turn);
+        if state.acted_turn == Some(state.turn_generation) {
+            return Err(Error::StaleTurn);
         }
-        self.send(
+        let stamp = now_ms();
+        let id = state.ids.next(stamp);
+        let text = serde_json::to_string(&envelope(
             "player_action",
             player_action_payload(
                 action,
@@ -593,9 +644,13 @@ impl GameSession {
                 snapshot.hand_id.as_deref(),
                 amount,
             ),
-            true,
-        )
-        .await
+            stamp,
+            Some(&id),
+        ))?;
+        // Reserve before I/O, including cancellation and uncertain delivery.
+        // Neither repeated snapshots nor reconnect may erase this reservation.
+        state.acted_turn = Some(state.turn_generation);
+        send_locked(&self.inner, &mut writer, &mut state, text).await
     }
 
     pub async fn fold(&self) -> Result<()> {
@@ -684,6 +739,7 @@ impl GameSession {
     }
 
     pub async fn reconnect(&self) -> Result<Arc<TableSnapshot>> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
         let join =
             self.inner.state.lock().await.join.clone().ok_or_else(|| {
                 Error::Protocol("cannot reconnect before joining a table".to_owned())
@@ -692,42 +748,63 @@ impl GameSession {
         self.stop_connection().await;
         self.connect().await?;
         self.inner.state.lock().await.mode = join.mode;
-        self.send("join_table", join.payload, false).await?;
-        self.wait_for_snapshot(baseline, None).await
+        let result = async {
+            self.send("join_table", join.payload, false).await?;
+            self.wait_for_snapshot(baseline, None).await
+        }
+        .await;
+        if result.is_err() {
+            self.stop_connection().await;
+        }
+        result
     }
 
     /// Gracefully leaves the table and closes the underlying socket. This operation is idempotent.
     pub async fn leave(&self) -> Result<()> {
-        {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let (seated, joined) = {
             let mut state = self.inner.state.lock().await;
-            if state.closed {
-                return Ok(());
-            }
-            state.closed = true;
+            let seated =
+                !state.closed && self.snapshot().is_some_and(|snapshot| snapshot.is_seated());
+            let joined = !state.closed && state.join.is_some();
+            invalidate_connection(&self.inner, &mut state, None);
+            (seated, joined)
+        };
+        if seated {
+            let _ = self.send_inner("stand_up", json!({}), true, true).await;
         }
-        if self.snapshot().is_some_and(|snapshot| snapshot.is_seated()) {
-            let _ = self.send("stand_up", json!({}), true).await;
-        }
-        if self.inner.state.lock().await.join.is_some() {
-            let _ = self.send("sit_out", json!({}), false).await;
-            let _ = self.send("leave_table", json!({}), false).await;
+        if joined {
+            let _ = self.send_inner("sit_out", json!({}), false, true).await;
+            let _ = self.send_inner("leave_table", json!({}), false, true).await;
         }
         self.stop_connection().await;
-        let _ = self.inner.events.send(GameEvent::Closed);
         Ok(())
     }
 
     pub(crate) async fn close_from_client(inner: Arc<SessionInner>) {
+        inner.public_handles.fetch_add(1, Ordering::Relaxed);
         let _ = Self { inner }.leave().await;
     }
 
     async fn send(&self, message_type: &str, payload: Value, action_id: bool) -> Result<()> {
+        self.send_inner(message_type, payload, action_id, false)
+            .await
+    }
+
+    async fn send_inner(
+        &self,
+        message_type: &str,
+        payload: Value,
+        action_id: bool,
+        closing: bool,
+    ) -> Result<()> {
+        let mut writer = self.inner.writer.lock().await;
+        let mut state = self.inner.state.lock().await;
+        if state.closed && !closing {
+            return Err(Error::Closed);
+        }
         let stamp = now_ms();
-        let generated = if action_id {
-            Some(self.inner.state.lock().await.ids.next(stamp))
-        } else {
-            None
-        };
+        let generated = action_id.then(|| state.ids.next(stamp));
         let text = serde_json::to_string(&envelope(
             message_type,
             payload,
@@ -735,45 +812,107 @@ impl GameSession {
             generated.as_deref(),
         ))
         .map_err(|_| Error::Protocol("could not encode an outbound message".to_owned()))?;
-        let mut writer = self.inner.writer.lock().await;
-        writer
-            .as_mut()
-            .ok_or(Error::Closed)?
-            .send(Message::Text(text.into()))
-            .await
-            .map_err(|error| Error::Transport(format!("WebSocket send failed: {error}")))
+        send_locked(&self.inner, &mut writer, &mut state, text).await
     }
 
     async fn require_open(&self) -> Result<()> {
-        if self.inner.state.lock().await.closed || self.inner.writer.lock().await.is_none() {
+        if self.inner.state.lock().await.closed {
             return Err(Error::Closed);
         }
         Ok(())
     }
 
     async fn stop_connection(&self) {
-        abort_task(&self.inner.heartbeat_task);
-        abort_task(&self.inner.receiver_task);
+        {
+            let mut state = self.inner.state.lock().await;
+            abort_task(&self.inner.heartbeat_task);
+            abort_task(&self.inner.receiver_task);
+            invalidate_connection(&self.inner, &mut state, None);
+        }
         if let Some(mut writer) = self.inner.writer.lock().await.take() {
-            let _ = writer.close().await;
+            let _ = timeout(self.inner.config.websocket_timeout, writer.close()).await;
+        }
+    }
+}
+
+impl Clone for GameSession {
+    fn clone(&self) -> Self {
+        self.inner.public_handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
         }
     }
 }
 
 impl Drop for GameSession {
     fn drop(&mut self) {
-        // The receiver and heartbeat each hold one Arc. Abort both when the last public handle drops.
-        if Arc::strong_count(&self.inner) <= 3 {
+        if self.inner.public_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
             abort_task(&self.inner.heartbeat_task);
             abort_task(&self.inner.receiver_task);
         }
     }
 }
 
+// A cancelled send can leave bytes buffered in the sink. Never restore that
+// sink or close/flush it; invalidate while the caller still holds the state lock.
+struct PendingSend<'a> {
+    inner: &'a SessionInner,
+    state: &'a mut SessionState,
+    completed: bool,
+}
+
+impl Drop for PendingSend<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            invalidate_connection(
+                self.inner,
+                self.state,
+                Some("WebSocket send cancelled; delivery is unknown".to_owned()),
+            );
+            abort_task(&self.inner.receiver_task);
+            abort_task(&self.inner.heartbeat_task);
+        }
+    }
+}
+
+async fn send_locked(
+    inner: &SessionInner,
+    slot: &mut Option<SocketWriter>,
+    state: &mut SessionState,
+    text: String,
+) -> Result<()> {
+    let mut writer = slot.take().ok_or(Error::Closed)?;
+    let mut pending = PendingSend {
+        inner,
+        state,
+        completed: false,
+    };
+    let result = timeout(
+        inner.config.websocket_timeout,
+        writer.send(Message::Text(text.into())),
+    )
+    .await
+    .map_err(|_| Error::Timeout(inner.config.websocket_timeout))
+    .and_then(|result| {
+        result.map_err(|error| Error::Transport(format!("WebSocket send failed: {error}")))
+    });
+    if let Err(error) = &result {
+        invalidate_connection(inner, pending.state, Some(error.to_string()));
+        abort_task(&inner.receiver_task);
+        abort_task(&inner.heartbeat_task);
+    } else {
+        *slot = Some(writer);
+    }
+    pending.completed = true;
+    result
+}
+
 async fn receive_loop(
     inner: Arc<SessionInner>,
     mut reader: futures_util::stream::SplitStream<Socket>,
+    generation: u64,
 ) {
+    let mut failure = None;
     while let Some(frame) = reader.next().await {
         let result = match frame {
             Ok(Message::Text(text)) => decode_server_message(&text),
@@ -783,25 +922,52 @@ async fn receive_loop(
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => continue,
             Err(error) => {
-                let _ = inner.events.send(GameEvent::ConnectionError(format!(
-                    "WebSocket receive failed: {error}"
-                )));
-                return;
+                failure = Some(format!("WebSocket receive failed: {error}"));
+                break;
             }
         };
         match result {
-            Ok(message) => handle_server_message(&inner, message).await,
+            Ok(message) => handle_server_message(&inner, message, generation).await,
             Err(error) => {
-                let _ = inner
-                    .events
-                    .send(GameEvent::ConnectionError(error.to_string()));
-                return;
+                failure = Some(error.to_string());
+                break;
             }
         }
     }
+    finish_receive(&inner, generation, failure).await;
 }
 
-async fn handle_server_message(inner: &Arc<SessionInner>, message: ServerMessage) {
+async fn finish_receive(inner: &SessionInner, generation: u64, failure: Option<String>) {
+    let mut state = inner.state.lock().await;
+    if state.connection_generation != generation {
+        return;
+    }
+    invalidate_connection(inner, &mut state, failure);
+    abort_task(&inner.heartbeat_task);
+}
+
+// Called with the same lock used for snapshot publication and action reservation.
+// Keep turn history even when the actionable snapshot is discarded.
+fn invalidate_connection(inner: &SessionInner, state: &mut SessionState, error: Option<String>) {
+    let notify = !state.closed || inner.snapshots.borrow().is_some();
+    state.closed = true;
+    // Aborted tasks can still finish their current poll on another runtime thread.
+    // Reject all later publications and cleanup from this connection generation.
+    state.connection_generation += 1;
+    inner.snapshots.send_replace(None);
+    if let Some(error) = error {
+        let _ = inner.events.send(GameEvent::ConnectionError(error));
+    }
+    if notify {
+        let _ = inner.events.send(GameEvent::Closed);
+    }
+}
+
+async fn handle_server_message(inner: &Arc<SessionInner>, message: ServerMessage, generation: u64) {
+    let mut state = inner.state.lock().await;
+    if state.closed || state.connection_generation != generation {
+        return;
+    }
     let raw = Arc::new(message.raw);
     let _ = inner.raw_messages.send(Arc::clone(&raw));
     match message.message_type.as_str() {
@@ -809,26 +975,8 @@ async fn handle_server_message(inner: &Arc<SessionInner>, message: ServerMessage
             let _ = inner.events.send(GameEvent::Authenticated);
         }
         "snapshot" => {
-            if let Some(mut snapshot) = message.snapshot {
-                let mut state = inner.state.lock().await;
-                if snapshot.mode == GameMode::Unknown && snapshot.is_friend_table {
-                    snapshot.mode = GameMode::Friends;
-                }
-                if snapshot.mode != GameMode::Unknown {
-                    state.mode = snapshot.mode;
-                }
-                let version = inner
-                    .snapshots
-                    .borrow()
-                    .as_ref()
-                    .map_or(1, |previous| previous.version + 1);
-                drop(state);
-                let snapshot = Arc::new(snapshot);
-                inner.snapshots.send_replace(Some(VersionedSnapshot {
-                    version,
-                    snapshot: Arc::clone(&snapshot),
-                }));
-                let _ = inner.events.send(GameEvent::Snapshot(snapshot));
+            if let Some(snapshot) = message.snapshot {
+                publish_snapshot(inner, &mut state, snapshot);
             }
         }
         "seat_rejected" => {
@@ -899,7 +1047,36 @@ async fn handle_server_message(inner: &Arc<SessionInner>, message: ServerMessage
     }
 }
 
-async fn heartbeat_loop(inner: Arc<SessionInner>) {
+fn publish_snapshot(inner: &SessionInner, state: &mut SessionState, mut snapshot: TableSnapshot) {
+    if snapshot.mode == GameMode::Unknown && snapshot.is_friend_table {
+        snapshot.mode = GameMode::Friends;
+    }
+    if snapshot.mode != GameMode::Unknown {
+        state.mode = snapshot.mode;
+    }
+    if let Some(seat) = snapshot.to_act_seat {
+        let position = TurnPosition {
+            table_id: snapshot.table_id.clone(),
+            hand_id: snapshot.hand_id.clone(),
+            street: snapshot.street.clone(),
+            seat,
+        };
+        if state.turn_position.as_ref() != Some(&position) {
+            state.turn_generation += 1;
+            state.turn_position = Some(position);
+        }
+    }
+    state.snapshot_version += 1;
+    let version = state.snapshot_version;
+    let snapshot = Arc::new(snapshot);
+    inner.snapshots.send_replace(Some(VersionedSnapshot {
+        version,
+        snapshot: Arc::clone(&snapshot),
+    }));
+    let _ = inner.events.send(GameEvent::Snapshot(snapshot));
+}
+
+async fn heartbeat_loop(inner: Arc<SessionInner>, generation: u64) {
     let mut ticker = interval(inner.config.heartbeat_interval);
     ticker.tick().await;
     loop {
@@ -907,14 +1084,15 @@ async fn heartbeat_loop(inner: Arc<SessionInner>) {
         let Ok(text) = serde_json::to_string(&envelope("ping", json!({}), now_ms(), None)) else {
             return;
         };
-        let result = {
-            let mut writer = inner.writer.lock().await;
-            match writer.as_mut() {
-                Some(writer) => writer.send(Message::Text(text.into())).await,
-                None => return,
-            }
-        };
-        if result.is_err() {
+        let mut writer = inner.writer.lock().await;
+        let mut state = inner.state.lock().await;
+        if state.closed || state.connection_generation != generation {
+            return;
+        }
+        if send_locked(&inner, &mut writer, &mut state, text)
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -930,6 +1108,7 @@ async fn wait_for_event(
             match events.recv().await {
                 Ok(event) if predicate(&event) => return Ok(()),
                 Ok(GameEvent::ConnectionError(error)) => return Err(Error::Transport(error)),
+                Ok(GameEvent::Closed) => return Err(Error::Closed),
                 Ok(_) => {}
                 Err(error) => return Err(channel_error(&error)),
             }
@@ -967,6 +1146,7 @@ async fn wait_for_typed_event<T>(
         loop {
             match events.recv().await {
                 Ok(GameEvent::ConnectionError(error)) => return Err(Error::Transport(error)),
+                Ok(GameEvent::Closed) => return Err(Error::Closed),
                 Ok(event) => {
                     if let Some(value) = extract(event) {
                         return Ok(value);
@@ -1006,5 +1186,157 @@ fn abort_task(slot: &StdMutex<Option<JoinHandle<()>>>) {
         .take()
     {
         task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> GameSession {
+        let (snapshots, _) = watch::channel(None);
+        let (events, _) = broadcast::channel(128);
+        let (raw_messages, _) = broadcast::channel(128);
+        GameSession {
+            inner: Arc::new(SessionInner {
+                public_handles: AtomicUsize::new(1),
+                auth: AuthSession {
+                    token: secrecy::SecretString::new("test-token".to_owned()),
+                    user: serde_json::from_value(json!({"id": "hero", "username": "hero"}))
+                        .unwrap(),
+                    expires_in: None,
+                    is_new_user: false,
+                },
+                config: ClientConfig::default(),
+                lifecycle: Mutex::new(()),
+                writer: Mutex::new(None),
+                state: Mutex::new(SessionState {
+                    closed: false,
+                    connection_generation: 1,
+                    ids: ActionIdGenerator::create(),
+                    join: None,
+                    mode: GameMode::Bot,
+                    table_match: None,
+                    turn_position: None,
+                    turn_generation: 0,
+                    acted_turn: None,
+                    snapshot_version: 0,
+                    seating_pending: false,
+                    stand_up_pending: false,
+                }),
+                snapshots,
+                events,
+                raw_messages,
+                receiver_task: StdMutex::new(None),
+                heartbeat_task: StdMutex::new(None),
+            }),
+        }
+    }
+
+    fn snapshot(actor: u8) -> ServerMessage {
+        decode_server_message(
+            &json!({
+                "type": "snapshot",
+                "snapshot": {
+                    "tableId": "table", "handId": "hand", "street": "preflop",
+                    "youSeat": 1, "toActSeat": actor,
+                    "seats": [{"seat": 1, "status": "active", "stack": 100}],
+                    "allowed": {"call": 2}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_receiver_cannot_publish_or_close_replacement_connection() {
+        let game = session();
+        handle_server_message(&game.inner, snapshot(1), 1).await;
+        {
+            let mut state = game.inner.state.lock().await;
+            state.acted_turn = Some(state.turn_generation);
+            invalidate_connection(&game.inner, &mut state, None);
+            state.connection_generation = 3;
+            state.closed = false;
+        }
+        let mut events = game.subscribe_events();
+        handle_server_message(&game.inner, snapshot(2), 1).await;
+        finish_receive(&game.inner, 1, Some("old socket failed".to_owned())).await;
+        assert!(game.snapshot().is_none());
+        assert!(!game.is_closed().await);
+        assert!(events.try_recv().is_err());
+        handle_server_message(&game.inner, snapshot(1), 3).await;
+        let state = game.inner.state.lock().await;
+        assert_eq!(state.acted_turn, Some(state.turn_generation));
+        assert_eq!(game.snapshot_version(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_guard_invalidates_state_without_clearing_reservation() {
+        let game = session();
+        handle_server_message(&game.inner, snapshot(1), 1).await;
+        let mut events = game.subscribe_events();
+        {
+            let mut state = game.inner.state.lock().await;
+            state.acted_turn = Some(state.turn_generation);
+            drop(PendingSend {
+                inner: &game.inner,
+                state: &mut state,
+                completed: false,
+            });
+            assert_eq!(state.acted_turn, Some(state.turn_generation));
+        }
+        assert!(game.is_closed().await);
+        assert!(game.snapshot().is_none());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(GameEvent::ConnectionError(_))
+        ));
+        assert!(matches!(events.try_recv(), Ok(GameEvent::Closed)));
+    }
+
+    #[tokio::test]
+    async fn dropping_clone_does_not_abort_lone_receiver() {
+        let game = session();
+        let receiver = tokio::spawn(std::future::pending::<()>());
+        let abort = receiver.abort_handle();
+        replace_task(&game.inner.receiver_task, receiver);
+        drop(game.clone());
+        tokio::task::yield_now().await;
+        assert!(!abort.is_finished());
+        drop(game);
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+    }
+
+    #[tokio::test]
+    async fn queued_action_validates_snapshot_after_acquiring_writer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let mut peer = server.await.unwrap();
+        let (writer, _reader) = socket.split();
+        let game = session();
+        *game.inner.writer.lock().await = Some(writer);
+        handle_server_message(&game.inner, snapshot(1), 1).await;
+
+        let writer = game.inner.writer.lock().await;
+        let action = game.call();
+        tokio::pin!(action);
+        assert!(futures_util::poll!(&mut action).is_pending());
+        handle_server_message(&game.inner, snapshot(2), 1).await;
+        drop(writer);
+        assert!(matches!(action.await, Err(Error::IllegalAction(_))));
+        assert!(
+            timeout(Duration::from_millis(30), peer.next())
+                .await
+                .is_err()
+        );
+        assert!(game.inner.state.lock().await.acted_turn.is_none());
     }
 }
